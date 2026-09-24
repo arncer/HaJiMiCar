@@ -1,0 +1,39 @@
+# Model weights and exported model artifacts
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.onnx
+*.h5
+*.hdf5
+*.pb
+*.tflite
+*.model
+*.bin
+/weights/
+/checkpoints/
+
+# Images
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.webp
+*.bmp
+*.tif
+*.tiff
+*.svg
+
+# Documentation and local data
+*.md
+*.markdown
+*.txt
+!requirements.txt
+*.csv
+*.tsv
+*.jsonl
+
+# Python cache and local editor settings
+__pycache__/
+*.py[cod]
+.vscode/
