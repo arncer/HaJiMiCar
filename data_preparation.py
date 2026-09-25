@@ -3,6 +3,9 @@
 import json
 from config import data_dir
 import numpy as np
+import torch
+from features import normalize_coordinate, encode_heading, normalize_articulation
+import math
 
 """
 读取全部的训练数据集记录，方便按照编号选择不同的真实样本。
@@ -121,7 +124,20 @@ def read_tokenizer(data_dir):
 
 #144 把候选区域编号转换成区域中心编号
 def decode_candidate_centers(candidate_data,tokenizer_info):
-    candidate_tokens = candidate_data["candidate_topology_tokens"]
+    """
+    以第一个编号871为例
+    | 计算                     | 结果    |
+    | ---------------------- | ----- |
+    | 去掉偏移：`871 - 2`         | `869` |
+    | 区域行号：`869 // 32`       | `27`  |
+    | 区域列号：`869 % 32`        | `5`   |
+    | 中心横坐标：`(5 + 0.5) × 4`  | `22`  |
+    | 中心纵坐标：`(27 + 0.5) × 4` | `110` |
+
+    
+    """
+    
+    candidate_topology_tokens = candidate_data["candidate_topology_tokens"]
     
     grid_width = tokenizer_info["grid_shape"][1]
     region_stride_cells = tokenizer_info["region_stride_cells"]
@@ -129,6 +145,217 @@ def decode_candidate_centers(candidate_data,tokenizer_info):
     ## 计算每行的区域数量
     n_region_cols = grid_width // region_stride_cells
     
+    if(candidate_topology_tokens <2).any():
+        raise ValueError("候选中包含特殊编号或无效编号，不能直接解码")
+    
+    # 减去2，去掉特殊编号占用的偏移
+    candidate_region_indices = candidate_topology_tokens - 2
+    
+    # 计算行号和列号
+    candidate_region_rows = candidate_region_indices // n_region_cols
+    candidate_region_cols = candidate_region_indices % n_region_cols
+    
+    # 根据行号和列号计算区域中心坐标
+    candidate_grid_x = (candidate_region_cols +0.5) * region_stride_cells
+    candidate_grid_y = (candidate_region_rows +0.5) * region_stride_cells
+
+    return candidate_grid_x, candidate_grid_y
+    
+    
+#145 把区域中心整理成归一化的路线输入
+def prepare_route_batch(candidate_grid_x, candidate_grid_y, map_data):
+    """
+    接收区域中心横坐标、纵坐标，以及已读取的地图数据。
+    把区域中心整理成归一化的路线输入。
+    """
+    # 取出地图数组，用它的形状确定地图的宽度和高度
+    map_features = map_data["map_features"]
+    
+    route_x_tensor = torch.tensor(candidate_grid_x, dtype=torch.float32)
+    route_y_tensor = torch.tensor(candidate_grid_y, dtype=torch.float32)
+    
+    normalized_route_x_tensor = normalize_coordinate(
+        route_x_tensor,
+        map_features.shape[2]
+    )
+    normalized_route_y_tensor = normalize_coordinate(
+        route_y_tensor,
+        map_features.shape[1]
+    )
+    
+    normalized_route_tensor = torch.stack(
+        [normalized_route_x_tensor, normalized_route_y_tensor],
+        dim = 1
+    )
+    # 经典增加批次维度
+    normalized_route_batch = normalized_route_tensor.unsqueeze(0)
+    return normalized_route_batch
+
+# 146 把一个车辆状态整理成一个5维特征
+def prepare_state_features(state,map_data):
+    # 从地图中取出地图数组，原点和分辨率
+    map_features = map_data["map_features"]
+    map_origin = map_data["origin"]
+    map_resolution = map_data["resolution"]
+    
+    #方向角检查，当前地图方向角为0，可以沿用之前的坐标转换公式。检查这一点，避免把同一公式误用旋转之后的地图
+    if float(map_data["origin_yaw"]) != 0.0:
+        raise ValueError("当前坐标转换要求地图方向角0")
+    
+    # 先减去地图原点，再除以分辨率，把实际的位置转换成以“格”为单位
+    grid_x = (state[0] - map_origin[0]) / map_resolution
+    grid_y = (state[1] - map_origin[1]) / map_resolution
+    
+    # 归一化x,y
+    normalized_x = normalize_coordinate(grid_x, map_features.shape[2])
+    normalized_y = normalize_coordinate(grid_y, map_features.shape[1])
+    
+    # encode_heading(state[2])把航向角转换成余弦和正弦两个数
+    heading_features = encode_heading(state[2])
+    
+    # 把铰链角上限 35° 转换成弧度，再用已有函数归一化 state[3] 中的铰链角
+    articulation_limit_radians = math.radians(35.0)\
+    # 进行铰链角度的归一化，教练角度限制在+-35°之间
+    normalized_theta = normalize_articulation(
+        state[3],
+        articulation_limit_radians
+    )
+    
+    # 最终把所有特征拼接成一个5维特征向量
+    normalized_state_features = [
+        normalized_x,
+        normalized_y,
+        heading_features[0],
+        heading_features[1],
+        normalized_theta
+    ]
+    
+    # 转成float32类型的张量
+    normalized_state_tensor = torch.tensor(normalized_state_features, dtype=torch.float32)
+    
+    return normalized_state_tensor
+    
+#147 把起点和终点组合成完整的任务输入
+## 使用刚刚写好的归一化函数分别处理起点和终点状态，再按照起点在前、终点在后的顺序拼接，得到任务编码器所需要的[1,10]张量
+def prepare_task_batch(sample_data,map_data):
+    normalized_start_tensor = prepare_state_features(
+        sample_data["start_state"],
+        map_data
+    )
+    normalized_goal_tensor = prepare_state_features(
+        sample_data["goal_state"],
+        map_data
+    )
+    
+    # 按照起点在前终点在后进行任务拼接
+    normalized_task_tensor= torch.cat(
+        [normalized_start_tensor, normalized_goal_tensor],
+        dim = 0
+    )
+    
+    # 添加批次维度
+    normalized_task_batch = normalized_task_tensor.unsqueeze(0)
+    
+    return normalized_task_batch
+
+#148 准备当前候选的成功标签和对数耗时标签
+"""
+成功标签整理为 [1, 1] 的浮点张量。
+耗时先从毫秒转换成秒，再计算 ln(1＋耗时秒数)，也整理为 [1, 1]。
+"""
+def prepare_label_batches(candidate_data):
+    success_tensor = torch.tensor(
+        [candidate_data["candidate_success"]],dtype = torch.float32
+    )
+    # 增加批次维度
+    success_batch = success_tensor.unsqueeze(0)
+    # 将ms转换成s
+    time_seconds = candidate_data["candidate_time_ms"] / 1000.0
+    
+    time_tensor =torch.tensor(
+        [time_seconds],
+        dtype=torch.float32
+    )
+    
+    #计算ln(1＋耗时秒数)
+    time_batch = time_tensor.unsqueeze(0)
+    log_time_batch = torch.log1p(time_batch)
+    
+    return success_batch, log_time_batch
+    
+#149 把位置编码生成的过程整理成函数
+"""
+位置编码描述的是每个区域在候选序列中的先后顺序。这一步沿用之前的正弦、余弦计算方式，
+根据序列长度生成 [1, 区域数量, 128] 的张量。
+"""
+def prepare_position_encoding_batch(sequence_length,feature_dimension=128):
+    # 生成 0～sequence_length-1 的顺序编号，转换成浮点数，再整理成一列。当前形状为 [28, 1]。
+    position_indices = torch.arange(sequence_length)
+    position_values = position_indices.to(dtype=torch.float32)
+    position_column = position_values.unsqueeze(1)  # 形状变为 [sequence_length, 1]
+    
+    #偶数维度编号：生成 0、2、4……126，共 64 个编号，并转换成浮点数。
+    even_dimension_indices = torch.arange(
+        0,
+        feature_dimension,
+        2
+    )
+    even_dimension_values = even_dimension_indices.to(dtype=torch.float32)
+    
+    # 沿用之前的公式，让不同特征维度使用不同的变化频率，得到 [28, 64] 的角度张量。pp
+    position_exponents = even_dimension_values/feature_dimension
+    position_divisors = 10000 ** position_exponents
+    position_angles = position_column / position_divisors
+    
+    position_encoding = torch.zeros(
+        sequence_length,
+        feature_dimension,
+        dtype = torch.float32
+    )
+    # 将偶数维度的角度值填入位置编码张量
+    position_encoding[:,0::2] = torch.sin(position_angles)
+    # 将奇数维度的角度值填入位置编码张量
+    position_encoding[:,1::2] = torch.cos(position_angles)
+    
+    # 增加批次维度
+    position_encoding_batch = position_encoding.unsqueeze(0)
+    
+    return position_encoding_batch
+    
+#150 为地图四周补边，准备提取局部地图块
+"""
+后面每个区域中心都需要提取一个 32 × 32 的地图块。
+如果中心靠近地图边缘，直接切片可能得到不足大小的地图块。
+因此，先在地图四周各补 16 格，这一步采用全通道补 0 的边界处理约定。
+
+"""
+def prepare_padded_map(map_data,patch_half_size = 16):
+    map_tensor = torch.tensor(
+        map_data["map_features"],
+        dtype = torch.float32
+    )
+    
+    channel_count = map_tensor.shape[0]
+    map_height = map_tensor.shape[1]
+    map_width = map_tensor.shape[2]
+    
+    #创建更大的地图，初始值全部为0
+    padded_map_tensor = torch.zeros(
+        channel_count,
+        map_height+2 * patch_half_size,
+        map_width+2 * patch_half_size,
+        dtype = torch.float32
+    )
+    
+    # 原始地图放在新地图中间
+    ## 原来的中心坐标 (x, y) 对应新地图中的 (x + 16, y + 16)，后面裁剪时会用到。
+    padded_map_tensor[
+        :,
+        patch_half_size:patch_half_size + map_height, #从新地图的第16行开始放置原始地图
+        patch_half_size:patch_half_size + map_width, #从新地图的第16列开始放置原始地图
+    ] = map_tensor
+
+    return padded_map_tensor
     
 
 
@@ -162,4 +389,54 @@ if __name__ =="__main__":
     print("区域编号公式：",tokenizer_info["id_formula"])
     print("特殊编号：",tokenizer_info["special_tokens"])
     
+    candidate_grid_x , candidate_grid_y = decode_candidate_centers(
+        candidate_data,
+        tokenizer_info
+    )
+    
+    print("区域中心数量：",len(candidate_grid_x))
+    print("第一个区域中心（单位：格）",candidate_grid_x[0], candidate_grid_y[0])
+    print("最后一个区域中心（单位：格）",candidate_grid_x[-1], candidate_grid_y[-1])
+    
+    normalized_route_batch = prepare_route_batch(
+        candidate_grid_x,
+        candidate_grid_y,
+        map_data
+    )
+    print("归一化路线批次的形状：",normalized_route_batch.shape)
+    print("第一个归一化区域中心：",normalized_route_batch[0,0])
+    print("最后一个归一化的区域中心：",normalized_route_batch[0, -1])
+    
+    normalized_start_tensor = prepare_state_features(
+        sample_data["start_state"],
+        map_data
+    )
+    print("起点特征的形状：",normalized_start_tensor.shape)
+    print("起点的五维特征：",normalized_start_tensor)
+    
+    normalized_task_batch = prepare_task_batch(
+        sample_data,
+        map_data
+    )
+    
+    print("归一化任务批次的形状：",normalized_task_batch.shape)
+    print("归一化任务批次：",normalized_task_batch)
+    
+    success_batch,log_time_batch = prepare_label_batches(candidate_data)
+    print("成功标签：", success_batch)
+    print("成功标签形状：", success_batch.shape)
+    print("对数耗时标签：", log_time_batch)
+    print("对数耗时标签形状：", log_time_batch.shape)
+    
+    sequence_length = normalized_route_batch.shape[1]
+    position_encoding_batch = prepare_position_encoding_batch(
+        sequence_length
+    )
+    
+    print("位置编码批次的形状：",position_encoding_batch.shape)
+    print("第一个位置的前6个编码：",position_encoding_batch[0,0,:6])
+    
+    padded_map_tensor = prepare_padded_map(map_data)
+    print("原始地图的形状：",map_data["map_features"].shape)
+    print("填充后的地图形状：",padded_map_tensor.shape)
     
