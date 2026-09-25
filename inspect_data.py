@@ -706,7 +706,7 @@ print("更新后的总损失：",updated_total_loss.item())
 ## 本步新增一个循环，把刚才的训练过程重复执行。沿用已有模型和优化器，在前面那一次更新的基础上，再更新 10 次。
 model.train()
 
-for step in range(100):
+for step in range(10):
     optimizer.zero_grad() # 清空上一步的梯度
     
     # 是应用更新后的参数，对同一条候选重新预测。这里实际调用的是 model.forward() 方法，进行前向传播。
@@ -730,5 +730,52 @@ for step in range(100):
     optimizer.step() # 根据本次梯度执行一次参数更新，下一次循环会使用更新后的参数
     
     print(f"第{step+1}次追加损失，总损失：{total_loss.item()}")
+
+#130查看训练后的成功概率和预测耗时
+## 这次把模型输出转换成容易理解的数值，并与真实标签进行对比
+
+##切换到评估模式，关闭模型中的dropout等训练专用机制以及丢弃行为
+model.eval()
+
+## 下面的缩进不记录用于反向传播的计算图，减少内存开销。这次只查看训练后的预测结果，评估的时候通常与model.eval()配合使用
+with torch.no_grad():
+    eval_success_logits, eval_predicted_log_time = model(
+        candidate_map_patch_batch,
+        normalized_route_batch,
+        normalized_task_batch,
+        position_encoding_batch
+    )
+    eval_success_probability = torch.sigmoid(eval_success_logits)
+    ## 计算指数-1，因为之前使用的是对数耗时 = ln(1+耗时秒数)
+    eval_time_seconds = torch.expm1(eval_predicted_log_time)
+
+print("预测成功概率：", eval_success_probability.item())
+print("真实成功标签：", success_batch.item())
+print("预测耗时（秒）：", eval_time_seconds.item())
+print("真实耗时（秒）：", torch.expm1(log_time_batch).item())
     
-    
+#131 创建路线的填充掩码
+"""不同候选的区域数量可能不同。例如，两条路线分别有20个和28个区域，放进一个普通批次张量时，
+可以把段路线补到28个位置。多出的8个位置需要标记起来，避免被当成真实区域。这个就叫做填充掩码。
+| 掩码值     | 含义        |
+| ------- | --------- |
+| `False` | 真实区域，保留   |
+| `True`  | 填充位置，需要忽略 |
+当前之后一个候选，28个区域都是真实区域，因此先创建一个全部为false的掩码
+"""
+route_padding_mask = torch.zeros(
+    normalized_route_batch.shape[0],#当前候选批次的数量
+    normalized_route_batch.shape[1],#每条路线的区域数量或者叫做序列长度
+    dtype=torch.bool, # 掩码的类型为布尔型
+    device=normalized_route_batch.device # 掩码张量所在的设备，与输入张量保持一致
+)
+print("路线填充掩码的形状：", route_padding_mask.shape)
+print("路线填充掩码：", route_padding_mask)
+
+with torch.no_grad():
+    route_encoder_output = route_encoder(
+        candidate_region_features_batch,
+        position_encoding_batch,
+        route_padding_mask=route_padding_mask
+    )
+print("传入掩码后的路线特征形状：", route_encoder_output.shape)

@@ -30,17 +30,36 @@ class RouteEncoder(torch.nn.Module): #定义一种名为 RouteEncoder 的网络�
     #119 添加forward()把已有的路线计算穿起来
     ## 这一步将之前跑通的投影、位置编码相加、transformer、平均汇总放进一个函数。位置编码继续使用已有的position_encoding_batch
     ## 定义输入数据通过这个编码器时的计算流程，接收区域特征和位置编码
-    def forward(self,candidate_region_features_batch,position_encoding_batch):
+    # def forward(self,candidate_region_features_batch,position_encoding_batch):
+    #     ## 使用编码器中的投影层，让每个区域的66维特征转换成128维度表示
+    #     projected_region_features = self.region_projection(candidate_region_features_batch)
+    #     ## 加上位置编码
+    #     route_encoder_input = projected_region_features + position_encoding_batch
+    #     ## 通过Transformer，让区域之间的信息参与计算
+    #     transformer_output = self.transformer_layer(route_encoder_input)
+    #     ## 沿区域维度求平均，得到整条线路的[1,128]维度特征
+    #     route_feature = transformer_output.mean(dim=1)
+    #     return route_feature
+    def forward(
+        self,
+        candidate_region_features_batch,
+        position_encoding_batch,
+        # 新增 route_padding_mask=None：让路线编码器可以接收掩码。None 表示默认不提供掩码，因此之前只传入两个参数的调用仍然可以运行。
+        route_padding_mask = None
+    ):  
         ## 使用编码器中的投影层，让每个区域的66维特征转换成128维度表示
-        projected_region_features = self.region_projection(candidate_region_features_batch)
+        projected_region_features_batch = self.region_projection(candidate_region_features_batch)
         ## 加上位置编码
-        route_encoder_input = projected_region_features + position_encoding_batch
-        ## 通过Transformer，让区域之间的信息参与计算
-        transformer_output = self.transformer_layer(route_encoder_input)
+        route_encoder_input = projected_region_features_batch + position_encoding_batch
+        ##通过Transformer，让区域之间的信息参与计算
+        transformer_output = self.transformer_layer(
+            route_encoder_input,
+            ## 传入掩码，让 Transformer 层在计算注意力时忽略被掩码的位置
+            src_key_padding_mask=route_padding_mask,
+        )
         ## 沿区域维度求平均，得到整条线路的[1,128]维度特征
         route_feature = transformer_output.mean(dim=1)
         return route_feature
-        
         
 
 
