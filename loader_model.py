@@ -42,7 +42,9 @@ class LoaderModel(torch.nn.Module):
         candidate_map_patch_batch,
         normalized_route_batch,
         normalized_task_batch,
-        position_encoding_batch
+        position_encoding_batch,
+        #125 让完整模型也能接受并传递掩码
+        route_padding_mask=None
     ):
         # 从区域坐标中读取候选数量和长度
         batch_size = normalized_route_batch.shape[0]
@@ -67,7 +69,8 @@ class LoaderModel(torch.nn.Module):
         # 编码整条候选路线，当前输出[1,128]
         route_features = self.route_encoder(
             candidate_features_batch,
-            position_encoding_batch
+            position_encoding_batch,
+            route_padding_mask=route_padding_mask
         )
         
         # 编码起点终点任务信息，输出[1,32]

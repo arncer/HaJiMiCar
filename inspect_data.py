@@ -666,8 +666,8 @@ print(optimizer)
 ## 可以把梯度理解为某个参数发生变化的时候，总损失会怎么变化，优化器需要利用这些信息进行梯度调整
 optimizer.zero_grad()
 total_loss.backward()
-print("成功预测头的权重梯度形状：",model.success_head.weight.shape)
-print("耗时预测头的权重梯度形状：",model.time_head.weight.shape)
+print("成功预测头的权重梯度形状：", model.success_head.weight.grad)
+print("耗时预测头的权重梯度形状：", model.time_head.weight.grad)
 
 #127 执行第一次参数更新
 ## bias是成功预测头的偏置参数，它的作用是调整成功分数的基准值，它会影响最终的成功分数。
@@ -698,9 +698,11 @@ updated_time_loss = time_loss_function(
     log_time_batch
 )
 ## 沿用之前的耗时权重，将两个损失相加
-updated_total_loss = updated_success_loss + weighted_time_loss * time_loss_weight
+updated_total_loss = updated_success_loss + updated_time_loss * time_loss_weight
 print("更新前的总损失：", total_loss.item())
-print("更新后的总损失：",updated_total_loss.item())
+print("更新后的成功损失：", updated_success_loss.item())
+print("更新后的耗时损失：", updated_time_loss.item())
+print("更新后的总损失：", updated_total_loss.item())
 
 #129 用一条候选连续训练10次
 ## 本步新增一个循环，把刚才的训练过程重复执行。沿用已有模型和优化器，在前面那一次更新的基础上，再更新 10 次。
@@ -779,3 +781,157 @@ with torch.no_grad():
         route_padding_mask=route_padding_mask
     )
 print("传入掩码后的路线特征形状：", route_encoder_output.shape)
+
+with torch.no_grad():
+    route_features_without_mask = route_encoder(
+        candidate_region_features_batch,
+        position_encoding_batch
+    )
+#将上一步传入的掩码结果与不传入掩码的结果进行比较。torch.allclose 会判断两个张量在给定的相对和绝对容差范围内是否相等。
+# atol 表示绝对容差，两个张量的元素差值小于该值时认为相等
+same_result = torch.allclose(
+    route_encoder_output,
+    route_features_without_mask,
+    rtol = 0,
+    atol = 0.00001
+)
+print("掩码结果：", route_encoder_output)
+print("不传掩码结果：", route_features_without_mask)
+print("全false掩码与不掩码的结果是否一致：",same_result)
+
+#134 现在检查掩码中出现true时，指定位置是否真的被忽略。将路线编码器设为评估模式，关闭 Dropout 的随机丢弃，方便比较。
+route_encoder.eval() # 切换到评估模式，确保掩码行为与训练模式一致
+# 复制一遍掩码，方便比较
+test_padding_mask = route_padding_mask.clone()
+test_padding_mask[:,24:]= True #将第25个及之后的区域标记为填充位置
+
+with torch.no_grad():
+    # 先计算截断后的路线特征，再计算带掩码的路线特征
+    shortened_route_features =route_encoder(
+        #第1个：表示所有候选，第二个表示所有区块，第三个：表示所有特征
+        candidate_region_features_batch[:,:24,:],
+        position_encoding_batch[:,:24,:]
+    )
+    # 带掩码的路线特征，掩码中为True的位置应该被忽略，表示填充的地方
+    masked_route_features = route_encoder(
+        candidate_region_features_batch,
+        position_encoding_batch,
+        route_padding_mask=test_padding_mask
+    )
+same_result = torch.allclose(
+    shortened_route_features,
+    masked_route_features,
+    rtol = 0,
+    atol = 0.00001
+)
+print("屏蔽最后4个位置与只输入前24个位置的结果是否一致：", same_result)
+
+#135 检查完整模型在传入掩码后的行为
+model.eval() # 切换到评估模式，确保后续推理行为与训练模式一致
+with torch.no_grad():
+    masked_success_logits,masked_predicted_log_time = model(
+        candidate_map_patch_batch,
+        normalized_route_batch,
+        normalized_task_batch,
+        position_encoding_batch,
+        route_padding_mask=test_padding_mask
+    )
+print("完整模型传入掩码后的成功分数形状：",masked_success_logits.shape)
+print("完整模型传入掩码后的对数耗时形状：",masked_predicted_log_time.shape)
+
+#136 让模型一次处理两条候选
+"""
+我们利用已有数据构造一个测试批次。
+- 第一条:28个区域全部参与计算。
+- 第二条：前24个区域参与计算，最后四个位置作为填充位置，由掩码忽略
+"""
+# 拼接两份局部地图
+two_map_patch_batch = torch.cat(
+    [candidate_map_patch_batch,candidate_map_patch_batch], dim=0
+)
+
+# 拼接两份区域地图
+two_route_batch = torch.cat(
+    [normalized_route_batch,normalized_route_batch], 
+    dim=0
+)
+
+# 拼接两份任务特征
+two_task_batch = torch.cat(
+    [normalized_task_batch,normalized_task_batch],
+    dim=0
+)
+
+# 拼接两份位置编码
+two_position_encoding_batch = torch.cat(
+    [position_encoding_batch,position_encoding_batch],  
+    dim=0
+)
+# 第一条没有填充，第二条忽略最后四个位置
+two_padding_mask = torch.cat(
+    [route_padding_mask,test_padding_mask], #28 24
+    dim=0
+)
+"""
+| 输入    | 拼接后的形状            |
+| ----- | ----------------- |
+| 局部地图块 | `[56, 3, 32, 32]` |每个区域块的局部地图 是 `[3, 32, 32]` 的图像 |
+| 区域坐标  | `[2, 28, 2]`      |每个任务区域的坐标是二维的 (x, y) |
+| 任务特征  | `[2, 10]`         |每个任务有10维特征 |
+| 位置编码  | `[2, 28, 128]`    |每个区域的位置编码是128维 |
+| 填充掩码  | `[2, 28]`         |True表示该位置是填充，应该被忽略 |
+
+"""
+
+model.eval() # 切换到评估模式，确保后续推理行为与训练模式一致
+with torch.no_grad():
+    two_success_logits, two_predicted_log_time = model(
+        two_map_patch_batch,
+        two_route_batch,
+        two_task_batch,
+        two_position_encoding_batch,
+        route_padding_mask=two_padding_mask
+    )
+print("两条候选的成功分数形状：", two_success_logits.shape)
+print("两条候选的对数耗时形状：", two_predicted_log_time.shape)
+
+#136检查批量预测与逐条预测是否一致
+"""
+同一个模型在评估模式下，处理相同输入时，两条候选一起计算，应当与分别计算得到基本一致的结果。
+这可以检查批次和模型内部的形状整理是否正确。我们直接使用之前保存的单条预测
+| 候选               | 单独预测时的变量                                            |
+| ---------------- | --------------------------------------------------- |
+| 第 1 条：全部 28 个区域  | `eval_success_logits`、`eval_predicted_log_time`     |
+| 第 2 条：忽略最后 4 个位置 | `masked_success_logits`、`masked_predicted_log_time` |
+
+"""
+## 按批次中的顺序，拼接两次单独预测的成功分数
+separate_success_logits = torch.cat(
+    [eval_success_logits,masked_success_logits],
+    dim=0
+)
+
+## 按相同的顺序拼接对数耗时
+separate_predicted_log_time = torch.cat(
+    [eval_predicted_log_time,masked_predicted_log_time],
+    dim=0
+)
+
+## 比较成功分数
+same_success_result = torch.allclose(
+    two_success_logits,
+    separate_success_logits,
+    rtol = 0, # rtol表示相对误差的容忍度
+    atol = 0.00001 # 表示绝对误差的容忍度
+)
+
+## 比较耗时
+same_time_result = torch.allclose(
+    two_predicted_log_time,
+    separate_predicted_log_time,
+    rtol = 0,
+    atol = 0.00001
+)
+
+print("批量与逐条预测的成功分数是否一致：",same_success_result)
+print("批量与逐条预测的对数耗时是否一致：",same_time_result)

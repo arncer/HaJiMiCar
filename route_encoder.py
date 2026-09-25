@@ -45,7 +45,7 @@ class RouteEncoder(torch.nn.Module): #定义一种名为 RouteEncoder 的网络�
         candidate_region_features_batch,
         position_encoding_batch,
         # 新增 route_padding_mask=None：让路线编码器可以接收掩码。None 表示默认不提供掩码，因此之前只传入两个参数的调用仍然可以运行。
-        route_padding_mask = None
+        route_padding_mask = None #若传或传反，后续本来不能参与注意力的也会参与注意力
     ):  
         ## 使用编码器中的投影层，让每个区域的66维特征转换成128维度表示
         projected_region_features_batch = self.region_projection(candidate_region_features_batch)
@@ -58,9 +58,40 @@ class RouteEncoder(torch.nn.Module): #定义一种名为 RouteEncoder 的网络�
             src_key_padding_mask=route_padding_mask,
         )
         ## 沿区域维度求平均，得到整条线路的[1,128]维度特征
-        route_feature = transformer_output.mean(dim=1)
-        return route_feature
+        ##注意力掩码不会替我们修改最后的平均计算，例如例如，真实数值是 2、4，后面补了两个零：
+        # 对全部位置求平均：(2＋4＋0＋0) ÷ 4 = 1.5
+        #只对真实位置求平均：(2＋4) ÷ 2 = 3
         
+        if route_padding_mask is None:
+            route_features = transformer_output.mean(dim=1)
+        else:
+            # ~route_padding_mask将bool值反转。原来真实区域对应false，反转后对应true方便统计
+            valid_region_mask = ~route_padding_mask
+            # 沿区域维度统计真实区域数量。valid_region_mask 中 True 表示真实区域，False 表示填充位置
+            valid_region_count = valid_region_mask.sum(dim=1, keepdim=True)
+            # 检查数量是否为零：如果某条候选全部是填充位置，就报错，避免除以零。
+            if(valid_region_count==0).any():
+                raise ValueError("每条候选至少需要一个真实区域")
+            """
+            | 变量                 | `True` 表示什么 | 用途                        |
+            | -------------------- | -----------    | ------------------------- |
+            | `route_padding_mask` | 填充位置        | 告诉 `masked_fill` 哪些位置需要清零 |
+            | `valid_region_mask`  | 真实区域        | 统计真实区域数量                  |
+
+            """
+            
+            # 把掩码位置从[batch_size, seq_len]扩展到[batch_size, seq_len, hidden_dim]，以便与 transformer_output 的形状匹配
+            ## 这里应该使用route_padding_mask，因为它标记了哪些位置是填充的，需要在 masked_fill 中将这些位置的特征设为0，表示不需要计算。
+            ## 而valid_region_mask false会变成True，表示填充位置，但在这里我们不直接使用它，而是使用route_padding_mask来进行masked_fill。
+            expanded_padding_mask = route_padding_mask.unsqueeze(2)
+            # 把掩码为True的填充位置对应的特征设为0 # [B, L, 128]
+            valid_transformer_output = transformer_output.masked_fill(
+                expanded_padding_mask,
+                0.0
+            )
+            #将真实区域的特征相加，再除以真实区域数量，得到 [1, 128] 的路线特征。
+            route_features = valid_transformer_output.sum(dim=1) / valid_region_count
+        return route_features
 
 
 if __name__ == "__main__":
