@@ -466,7 +466,67 @@ def prepare_candidate(
     }
     
     return prepared_candidate
+
+#157 补齐两条线路，并生成批量掩码
+"""
+统一长度取最长路线的 29：
+- 第一条路线末尾补一个位置，该位置的掩码为 True。
+- 第二条路线保持原长度，所有位置的掩码为 False。
+"""
+def prepare_padded_route_batch(prepared_candidates):
+    batch_size = len(prepared_candidates)
     
+    # 记录每条路线的真实长度与最大值
+    route_lengths = []
+    max_sequence_length = 0
+    for current_candidate in prepared_candidates:
+        sequence_length = current_candidate["normalized_route_batch"].shape[1]
+        route_lengths.append(sequence_length)
+        # 记录最大值 也可以直接max(route_lengths)简单操作
+        if sequence_length > max_sequence_length:
+            max_sequence_length = sequence_length
+            
+    # 创建补齐后饿路线坐标，初始值全为0
+    padded_route_batch = torch.zeros(
+        batch_size,
+        max_sequence_length,
+        2,  # 假设每个路线点有2个坐标值 (x, y)
+        dtype=torch.float32
+    )
+    
+    # 初始时把所有位置都标记为填充位置
+    batched_route_padding_mask = torch.ones(
+        batch_size,
+        max_sequence_length,
+        dtype=torch.bool
+    )
+    
+    for batch_index in range(batch_size):
+        sequence_length = route_lengths[batch_index]
+        current_candidate = prepared_candidates[batch_index]
+        
+        # 去掉单条线路原先的批次维度[1,L,2] -> [L,2]
+        current_route = current_candidate["normalized_route_batch"][0]
+        
+        # 将真实坐标复制到对应候选的前面部分
+        padded_route_batch[
+            batch_index,
+            :sequence_length,
+            :
+        ] = current_route
+        
+        # 真实区域对应的掩码改为false,是否为填充位置由掩码判断，不能单凭坐标是否为零来判断。
+        batched_route_padding_mask[
+            batch_index,
+            :sequence_length
+        ] = False
+        
+    return padded_route_batch,batched_route_padding_mask
+
+        
+
+
+
 
 if __name__ =="__main__":
     train_records = read_index_records(data_dir)
@@ -576,7 +636,7 @@ if __name__ =="__main__":
     for tensor_name,tensor_value in prepared_candidate.items():
         print(tensor_name,"的形状：",tensor_value.shape)
         
-    #155 准备两条真是候选的数据
+    #155 准备两条真实候选的数据
     """
     这一步读取爹日条训练记录中的第0条候选，在与前面准备好的第一条候选放到一个列表中。每条候选保留自己的路线长度和标签
     """
@@ -621,4 +681,13 @@ if __name__ =="__main__":
             current_candidate["candidate_map_patch_batch"].shape
         )
         
-     
+
+    padded_route_batch,batched_route_padding_mask = (
+        prepare_padded_route_batch(prepared_candidates)
+    )
+    print("补齐后的路线批次形状：",padded_route_batch.shape)
+    print("批量路线掩码的形状：",batched_route_padding_mask.shape)
+    print("每条路线的填充位置数量：",batched_route_padding_mask.sum(dim=1))
+    print("两条路线最后一个位置掩码：",batched_route_padding_mask[:,-1])
+    
+    
