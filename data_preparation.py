@@ -356,17 +356,125 @@ def prepare_padded_map(map_data,patch_half_size = 16):
     ] = map_tensor
 
     return padded_map_tensor
+
+#151 提取候选路线中每个区域对应的局部地图块
+## 样例1当前路线由28个区域，这一步得到28个[3,32,32]的地图块
+def prepare_map_patch_batch(
+    candidate_grid_x,
+    candidate_grid_y,
+    map_data,
+    patch_half_size = 16,
+):
+    padded_map_tensor = prepare_padded_map(
+        map_data,
+        patch_half_size=patch_half_size
+    )
+    candidate_map_patches = []
+    for point_index in range(len(candidate_grid_x)):
+        # 将原地图中的中心坐标转换为补边后的中心坐标,例如原来的 (22, 110)，在补边地图中对应 (38, 126)。这个偏移只用于裁剪，路线归一化坐标仍使用原来的坐标。
+        center_x = int(candidate_grid_x[point_index]) + patch_half_size
+        center_y = int(candidate_grid_y[point_index]) + patch_half_size
+        
+        # 按照[通道，行，列]的顺序提取局部地图
+        local_patch = padded_map_tensor[
+            :,
+            center_y - patch_half_size:center_y + patch_half_size,
+            center_x - patch_half_size:center_x + patch_half_size
+        ]
+        candidate_map_patches.append(local_patch)
     
+    # 将所有局部地图沿新维度堆叠起来,torch.stack(..., dim=0) 将 28 个 [3, 32, 32] 张量组成 [28, 3, 32, 32]。
+    candidate_map_patch_batch = torch.stack(
+        candidate_map_patches,
+        dim = 0
+    )
+    return candidate_map_patch_batch
+    
+#152 封装路线填充掩码的生成函数
+## 当前只处理一条候选路线，28个位置全是真实区域，所以掩码应该为false
+def prepare_route_padding_mask(sequence_length):
+    if sequence_length <=0:
+        raise ValueError("每个候选线路至少需要一个真实区域")
+    
+    route_padding_mask = torch.zeros(
+        1,#表示一条候选线路，sequence_length 表示该路线中的区域数量
+        sequence_length,
+        dtype = torch.bool
+    )
+    
+    return route_padding_mask
 
 
+#153 把已经验证的函数组合起来，统一准备一条候选数据
+def prepare_candidate(
+    data_dir,
+    record,
+    tokenizer_info,
+    candidate_index = 0
+):
+    #读取任务样本，并选出其中一条候选
+    sample_data = read_sample_data(data_dir,record)
+    candidate_data = select_candidate_data(
+        sample_data,
+        candidate_index=candidate_index
+    )
+    
+    # 读取这个任务对应的地图
+    map_data = read_map_data(data_dir,record)
+    
+    # 将候选的区域编号解码为地图格坐标
+    candidate_grid_x,candidate_grid_y = decode_candidate_centers(
+        candidate_data,
+        tokenizer_info
+    )
+    
+    # 准备各个区域的局部地图块
+    candidate_map_patch_batch = prepare_map_patch_batch(
+        candidate_grid_x,
+        candidate_grid_y,
+        map_data
+    )
+    
+    # 准备归一化的路线坐标和任务特征
+    normalized_route_batch = prepare_route_batch(
+        candidate_grid_x,
+        candidate_grid_y,
+        map_data
+    )
+    
+    normalized_task_batch = prepare_task_batch(sample_data,map_data)
+    
+    # 根据路线长度，准备位置编码和填充掩码
+    sequence_length = normalized_route_batch.shape[1]
+    position_encoding_batch = prepare_position_encoding_batch(
+        sequence_length
+    )
+    route_padding_mask = prepare_route_padding_mask(sequence_length)
+    
+    # 准备成功标签和对数耗时标签
+    success_batch,log_time_batch = prepare_label_batches(candidate_data)
+    
+    # 将准备好的张量放进同一个字典
+    prepared_candidate = {
+        "candidate_map_patch_batch":candidate_map_patch_batch,
+        "normalized_route_batch":normalized_route_batch,
+        "normalized_task_batch":normalized_task_batch,
+        "position_encoding_batch":position_encoding_batch,
+        "route_padding_mask":route_padding_mask,
+        "success_batch":success_batch,
+        "log_time_batch":log_time_batch
+    }
+    
+    return prepared_candidate
+    
 
 if __name__ =="__main__":
     train_records = read_index_records(data_dir)
     print("训练索引记录数量：",len(train_records))
     print("第一条训练记录：", train_records[0])
     
-    first_sample = train_records[0]
-    sample_data = read_sample_data(data_dir, first_sample)
+    first_record = train_records[0]
+    sample_data = read_sample_data(data_dir, first_record)
     print("起点状态形态：",sample_data["start_state"].shape)
     print("终点状态形态：",sample_data["goal_state"].shape)
     print("候选数量：",len(sample_data["candidate_success"]))
@@ -377,7 +485,7 @@ if __name__ =="__main__":
     print("当前候选成功标签：",candidate_data["candidate_success"])
     print("当前候选的耗时（毫秒）：",candidate_data["candidate_time_ms"])
     
-    map_data = read_map_data(data_dir, first_sample)
+    map_data = read_map_data(data_dir, first_record)
     print("地图特征形状：",map_data["map_features"].shape)
     print("地图原点：",map_data["origin"])
     print("地图方向角：",map_data["origin_yaw"])
@@ -438,5 +546,79 @@ if __name__ =="__main__":
     
     padded_map_tensor = prepare_padded_map(map_data)
     print("原始地图的形状：",map_data["map_features"].shape)
-    print("填充后的地图形状：",padded_map_tensor.shape)
+    print("补边后地图张量的形状：",padded_map_tensor.shape)
     
+    
+    candidate_map_patch_batch = prepare_map_patch_batch(
+        candidate_grid_x,
+        candidate_grid_y,
+        map_data
+    )
+    
+    print("候选局部地图批次的形状：",candidate_map_patch_batch.shape)
+    print("第一个局部地图的形状：",candidate_map_patch_batch[0].shape)
+    
+    sequence_length = normalized_route_batch.shape[1]
+    route_padding_mask = prepare_route_padding_mask(sequence_length)
+    print("路线填充掩码的形状：",route_padding_mask.shape)
+    print("路线填充位置的数量：",route_padding_mask.sum().item())
+    
+    prepared_candidate = prepare_candidate(
+        data_dir,
+        first_record,
+        tokenizer_info,
+        candidate_index = 0
+    )
+    print(
+        "按统一键名读取位置编码：",
+        prepared_candidate["position_encoding_batch"].shape
+    )
+    for tensor_name,tensor_value in prepared_candidate.items():
+        print(tensor_name,"的形状：",tensor_value.shape)
+        
+    #155 准备两条真是候选的数据
+    """
+    这一步读取爹日条训练记录中的第0条候选，在与前面准备好的第一条候选放到一个列表中。每条候选保留自己的路线长度和标签
+    """
+    # 取出第二条训练记录
+    second_record = train_records[1]
+    
+    # 准备第二条记录中的第0条候选
+    second_prepared_candidate = prepare_candidate(
+        data_dir,
+        second_record,
+        tokenizer_info,
+        candidate_index = 0
+    )
+    # 将两条候选的数据字典放进一个列表
+    ### 列表允许两条路线长度不同，因此现在可以直接把它们放在一起。
+    prepared_candidates = [
+        prepared_candidate,
+        second_prepared_candidate
+    ]
+    print("当前候选数量：",len(prepared_candidates))
+    
+    print(
+        "直接读取第二条候选的路线形状：",
+        second_prepared_candidate["normalized_route_batch"].shape
+    )
+
+    print(
+        "直接读取第二条候选的局部地图形状：",
+        second_prepared_candidate["candidate_map_patch_batch"].shape
+    )
+    
+    for candidate_index in range(len(prepared_candidates)):
+        current_candidate = prepared_candidates[candidate_index]
+        
+        print(
+            "第",candidate_index+1,"条候选的路线形状：",
+            current_candidate["normalized_route_batch"].shape
+        )
+        
+        print(
+            "第",candidate_index+1,"条候选的局部地图形状：",
+            current_candidate["candidate_map_patch_batch"].shape
+        )
+        
+     
