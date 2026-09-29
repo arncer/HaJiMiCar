@@ -669,6 +669,25 @@ def collate_candidates(prepared_candidates):
     }
     return prepared_batch
 
+# 162 建立候选级索引，为数据集加载做准备
+## 外层循环遍历任务，内层循环遍历这个任务的所有候选
+def build_candidate_records(data_dir,records):
+    candidate_records = []
+    # 逐个读取任务样本吧
+    for record in records:
+        sample_data = read_sample_data(data_dir, record)
+        
+        # 当前任务包含多少条候选
+        candidate_count = len(sample_data["candidate_success"])
+        # 为当前任务的每条候选建立一条索引
+        for candidate_index in range(candidate_count):
+            candidate_record = {
+                "record":record,
+                "candidate_index":candidate_index
+            }
+            
+            candidate_records.append(candidate_record)
+    return candidate_records
 
 if __name__ =="__main__":
     train_records = read_index_records(data_dir)
@@ -866,3 +885,19 @@ if __name__ =="__main__":
     prepared_batch = collate_candidates(prepared_candidates)
     for tensor_name,tensor_value in prepared_batch.items():
         print(tensor_name,"的形状：",tensor_value.shape)
+        
+        
+    candidate_records = build_candidate_records(
+        data_dir,
+        train_records[:2]
+    )
+    print("用于建立索引的任务数量：", len(train_records[:2]))
+    print("这些任务包含的候选总数：", len(candidate_records))
+    
+    for candidate_record in candidate_records:
+        print(
+            "样本编号：",
+            candidate_record["record"]["sample_id"],
+            "候选编号：",
+            candidate_record["candidate_index"],
+        )
