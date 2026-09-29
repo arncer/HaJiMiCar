@@ -287,8 +287,10 @@ def prepare_label_batches(candidate_data):
 """
 位置编码描述的是每个区域在候选序列中的先后顺序。这一步沿用之前的正弦、余弦计算方式，
 根据序列长度生成 [1, 区域数量, 128] 的张量。
+两条路线补齐后的长度都是 29，因此位置编码需要整理为 [2, 29, 128]。
+每条路线都从位置 0 开始编号，同一位置使用相同的位置编码。
 """
-def prepare_position_encoding_batch(sequence_length,feature_dimension=128):
+def prepare_position_encoding_batch(sequence_length,feature_dimension=128,batch_size = 1):
     # 生成 0～sequence_length-1 的顺序编号，转换成浮点数，再整理成一列。当前形状为 [28, 1]。
     position_indices = torch.arange(sequence_length)
     position_values = position_indices.to(dtype=torch.float32)
@@ -317,9 +319,19 @@ def prepare_position_encoding_batch(sequence_length,feature_dimension=128):
     # 将奇数维度的角度值填入位置编码张量
     position_encoding[:,1::2] = torch.cos(position_angles)
     
-    # 增加批次维度
+    # 增加批次维度,[sequence_length, feature_dimension] 变为 [1, sequence_length, feature_dimension]
     position_encoding_batch = position_encoding.unsqueeze(0)
     
+    # 沿批次维度复制，每条候选获得一份位置编码
+    """
+    batch_size=1 保留了原来的默认行为，之前准备单条候选的调用仍然适用。
+repeat(batch_size, 1, 1) 表示第一维复制 batch_size 份，后两维不重复。因此 [1, 29, 128] 会变为 [2, 29, 128]。
+    """
+    position_encoding_batch = position_encoding_batch.repeat(
+        batch_size,
+        1,
+        1
+    )
     return position_encoding_batch
     
 #150 为地图四周补边，准备提取局部地图块
@@ -523,9 +535,93 @@ def prepare_padded_route_batch(prepared_candidates):
         
     return padded_route_batch,batched_route_padding_mask
 
+# 158 将局部地图块补齐，并整理成地图编码器所需要的形状  
+"""
+局部地图必须与路线位置对应。因此，第一条候选也需要补一个全零地图块。
+先得到 [2, 29, 3, 32, 32]，再把“候选数量”和“区域数量”两维合并，得到地图编码器需要的 [58, 3, 32, 32]
+"""
+
+def prepare_padded_map_patch_batch(
+    prepared_candidates,
+    max_sequence_length,
+):
+    batch_size = len(prepared_candidates)
+    
+    # 从第一条候选中读取单个地图块的尺寸
+    first_map_patches = prepared_candidates[0]["candidate_map_patch_batch"]
+    channel_cout = first_map_patches.shape[1]
+    patch_height = first_map_patches.shape[2]
+    patch_width = first_map_patches.shape[3]
+    
+    # 为每条候选预留相同数量的地图块，初始值全为0
+    padded_map_patches = torch.zeros(
+        batch_size,
+        max_sequence_length,
+        channel_cout,
+        patch_height,
+        patch_width,
+        dtype=torch.float32
+    )
+    
+    for batch_index in range(batch_size):
+        current_candidate = prepared_candidates[batch_index]
         
+        current_map_patches = current_candidate["candidate_map_patch_batch"]
+        sequence_length = current_candidate["normalized_route_batch"].shape[1]
+        
+        # 检查每个真实区域是否都有对应的地图块
+        if current_map_patches.shape[0] != sequence_length:
+            raise ValueError(
+                "路线区域数量与局部地图数量不一致"
+            )
+        
+        # 复制真实地图块，末尾的填充位置保持为0
+        padded_map_patches[
+            batch_index,:sequence_length,:,:,:
+        ] = current_map_patches
 
+    # 合并前两维，供地图编码器逐个处理地图块
+    batched_map_patch_batch = padded_map_patches.reshape(
+        batch_size * max_sequence_length,
+        channel_cout,
+        patch_height,
+        patch_width
+    )
 
+    return batched_map_patch_batch
+
+# 159 合并两条候选的任务特征和标签
+"""
+任务特征和标签都是每条候选一份，尺寸固定，可以直接沿批次维度拼接：
+- 任务特征：两个 [1, 10] 合并为 [2, 10]。
+- 成功标签：两个 [1, 1] 合并为 [2, 1]。
+- 对数耗时标签：两个 [1, 1] 合并为 [2, 1]
+
+"""
+def prepare_task_and_label_batches(prepared_candidates):
+    # 分别收集任务特征、成功标签和对数耗时标签
+    task_batch_list = []
+    success_batch_list = []
+    log_time_batch_list = []
+    
+    for current_candidate in prepared_candidates:
+        task_batch_list.append(
+            current_candidate["normalized_task_batch"]
+        )
+        
+        success_batch_list.append(
+            current_candidate["success_batch"]
+        )
+        
+        log_time_batch_list.append(
+            current_candidate["log_time_batch"]
+        )
+    # 将已有的批次维度进行拼接
+    batched_task_batch = torch.cat(task_batch_list,dim = 0)
+    batched_success_batch = torch.cat(success_batch_list,dim = 0)
+    batched_log_time_batch = torch.cat(log_time_batch_list,dim = 0)
+
+    return batched_task_batch, batched_success_batch, batched_log_time_batch
 
 
 if __name__ =="__main__":
@@ -690,4 +786,34 @@ if __name__ =="__main__":
     print("每条路线的填充位置数量：",batched_route_padding_mask.sum(dim=1))
     print("两条路线最后一个位置掩码：",batched_route_padding_mask[:,-1])
     
+    batch_size = padded_route_batch.shape[0]
+    
+    max_sequence_length = padded_route_batch.shape[1]
+    
+    batched_position_encoding_batch = prepare_position_encoding_batch(
+        max_sequence_length,
+        batch_size = batch_size
+    )
+    print("批量位置编码的形状：",batched_position_encoding_batch.shape)
+    print(
+        "两条线路第一个位置的前6个编码：",
+        batched_position_encoding_batch[:,0,:6]  
+    )
+    batched_map_patch_batch = prepare_padded_map_patch_batch(
+        prepared_candidates,
+        max_sequence_length
+    )
+    print("补齐并合并后的地图批次形状：",batched_map_patch_batch.shape)
+    print(
+        "填充地图块的绝对值综合：",
+        batched_map_patch_batch[28].abs().sum().item()
+    )
+    
+    batched_task_batch,batch_success_batch,batched_log_time_batch = (
+        prepare_task_and_label_batches(prepared_candidates)
+    )
+    
+    print("合并后的任务特征形状：",batched_task_batch.shape)
+    print("合并后的成功标签形状：",batch_success_batch.shape)
+    print("合并后的对数耗时标签形状：",batched_log_time_batch.shape)
     
