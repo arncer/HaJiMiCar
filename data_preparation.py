@@ -623,6 +623,52 @@ def prepare_task_and_label_batches(prepared_candidates):
 
     return batched_task_batch, batched_success_batch, batched_log_time_batch
 
+#161 封装完整的批次整理函数
+"""
+这个函数接收 prepared_candidates 列表，调用前面完成的函数，返回包含模型输入和标签的一个字典。
+"""
+def collate_candidates(prepared_candidates):
+    if len(prepared_candidates) == 0 :
+        raise ValueError("候选列表不能为空")
+    
+    # 补齐路线坐标，并生成对应的掩码
+    padded_route_batch, batched_route_padding_mask = (
+        prepare_padded_route_batch(prepared_candidates)
+    )
+    
+    batch_size = padded_route_batch.shape[0]
+    max_sequence_length = padded_route_batch.shape[1]
+    
+    # 按照相同的路线长度补齐局部地图块
+    batched_map_patch_batch = prepare_padded_map_patch_batch(
+        prepared_candidates,
+        max_sequence_length
+    )
+    
+    # 合并任务特征和标签特征
+    batched_task_batch,batched_success_batch,batched_log_time_batch = (
+        prepare_task_and_label_batches(prepared_candidates)
+    )
+    
+    # 生成整个批次的位置编码
+    batched_position_encoding_batch = prepare_position_encoding_batch(
+        max_sequence_length,
+        batch_size=batch_size  
+    )
+    
+    # 与使用单条候选相同的键名，保存整个批次的数据
+    prepared_batch = {
+        "candidate_map_patch_batch":batched_map_patch_batch,
+        "normalized_route_batch":padded_route_batch,
+        "normalized_task_batch":batched_task_batch,
+        "position_encoding_batch":batched_position_encoding_batch,
+        "route_padding_mask":batched_route_padding_mask,
+        "success_batch":batched_success_batch,
+        "log_time_batch":batched_log_time_batch
+        
+    }
+    return prepared_batch
+
 
 if __name__ =="__main__":
     train_records = read_index_records(data_dir)
@@ -817,3 +863,6 @@ if __name__ =="__main__":
     print("合并后的成功标签形状：",batch_success_batch.shape)
     print("合并后的对数耗时标签形状：",batched_log_time_batch.shape)
     
+    prepared_batch = collate_candidates(prepared_candidates)
+    for tensor_name,tensor_value in prepared_batch.items():
+        print(tensor_name,"的形状：",tensor_value.shape)
