@@ -623,7 +623,8 @@ def prepare_task_and_label_batches(prepared_candidates):
 
     return batched_task_batch, batched_success_batch, batched_log_time_batch
 
-#161 封装完整的批次整理函数
+#161 封装完整的批次整理函数,用于传递给 DataLoader作为 collate_fn
+# collate_fn是 DataLoader 用来将多个样本整理成一个批次的函数，这里指定为 collate_candidates。
 """
 这个函数接收 prepared_candidates 列表，调用前面完成的函数，返回包含模型输入和标签的一个字典。
 """
@@ -688,6 +689,41 @@ def build_candidate_records(data_dir,records):
             
             candidate_records.append(candidate_record)
     return candidate_records
+
+# 163 定义候选数据集candidateDateset
+"""
+这个数据集支持两种操作：
+- len(candidate_dataset)：查看候选总数。
+- candidate_dataset[0]：读取并准备第 0 条候选的输入和标签。
+torch.utils.data.Dataset 是 PyTorch 中用于表示数据集的抽象类，用户自定义的数据集需要继承该类并实现 __len__ 和 __getitem__ 方法。
+"""
+class CandidateDataset(torch.utils.data.Dataset):
+    def __init__(self,data_dir,candidate_records,tokenizer_info):
+        # 保存读取候选时需要的信息
+        self.data_dir = data_dir
+        self.candidate_records = candidate_records 
+        self.tokenizer_info = tokenizer_info
+    
+    # 数据集的长度等于候选索引的数量
+    def __len__(self):
+        return len(self.candidate_records)
+    
+    # 根据数据集索引，找到对应的任务和候选编号
+    def __getitem__(self,index):
+        candidate_record = self.candidate_records[index]
+        
+        record = candidate_record["record"]
+        candidate_index = candidate_record["candidate_index"]
+        
+        # 复用已经完成的单条候选准备函数
+        prepared_candidate = prepare_candidate(
+            data_dir = self.data_dir,
+            record = record,
+            tokenizer_info = self.tokenizer_info,
+            candidate_index = candidate_index
+        )
+        
+        return prepared_candidate
 
 if __name__ =="__main__":
     train_records = read_index_records(data_dir)
@@ -901,3 +937,44 @@ if __name__ =="__main__":
             "候选编号：",
             candidate_record["candidate_index"],
         )
+        
+
+    candidate_dataset = CandidateDataset(
+        data_dir = data_dir,
+        candidate_records = candidate_records,
+        tokenizer_info = tokenizer_info
+    )
+    
+    """
+    dataset=candidate_dataset：从刚才创建的数据集中读取候选。
+    batch_size=2：每个批次最多包含两条候选。
+    shuffle=False：按照索引顺序读取，方便对应前面的结果。
+    num_workers=0：在当前进程中读取数据，便于排查错误。
+    collate_fn=collate_candidates：指定如何把多条候选整理成一个批次。
+    这里只写函数名，不加括号，由 DataLoader 取出候选后调用它。
+    """
+    candidate_loader = torch.utils.data.DataLoader(
+        dataset=candidate_dataset,
+        batch_size = 2,
+        shuffle = False,
+        num_workers = 0,
+        collate_fn = collate_candidates
+    )
+    print("DataLoader中的批次：",len(candidate_loader))
+    # 读取一个批次，查看各个张量的形状,循环中的 loaded_batch，就是 collate_candidates 返回的数据字典。
+    for loader_batch in candidate_loader:
+        for tensor_name, tensor_value in loader_batch.items():
+            print(tensor_name, "的形状：", tensor_value.shape)
+    
+    print("数据集中的候选数量：",len(candidate_dataset))
+    first_dataset_candidate = candidate_dataset[0]
+    second_dataset_candidate = candidate_dataset[1]
+    print(
+        "数据集第0条候选的路线形状：",
+        first_dataset_candidate["normalized_route_batch"].shape
+    )
+
+    print(
+        "数据集第1条候选的路线形状：",
+        second_dataset_candidate["normalized_route_batch"].shape
+    )
