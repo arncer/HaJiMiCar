@@ -962,8 +962,8 @@ if __name__ =="__main__":
     )
     print("DataLoader中的批次：",len(candidate_loader))
     # 读取一个批次，查看各个张量的形状,循环中的 loaded_batch，就是 collate_candidates 返回的数据字典。
-    for loader_batch in candidate_loader:
-        for tensor_name, tensor_value in loader_batch.items():
+    for loaded_batch in candidate_loader:
+        for tensor_name, tensor_value in loaded_batch.items():
             print(tensor_name, "的形状：", tensor_value.shape)
     
     print("数据集中的候选数量：",len(candidate_dataset))
@@ -978,3 +978,120 @@ if __name__ =="__main__":
         "数据集第1条候选的路线形状：",
         second_dataset_candidate["normalized_route_batch"].shape
     )
+    # 165 把这个批次送入完整模型，完成一次前向预测
+    from map_encoder import map_encoder
+    from route_encoder import RouteEncoder,region_projection,transformer_layer
+    from task_encoder import task_encoder
+    from prediction_head import  fusion_encoder,success_head,time_head
+    from loader_model import LoaderModel
+    # 粗路线编码器
+    route_encoder = RouteEncoder(
+        region_projection,
+        transformer_layer
+    )
+    # 组装完整模型
+    model = LoaderModel(
+        map_encoder,
+        route_encoder,
+        task_encoder,
+        fusion_encoder,
+        success_head,
+        time_head
+    )
+    
+    # 切换到评估模式，进行一次前向预测
+    model.eval()
+    
+    with torch.no_grad():
+        batch_success_logits,batch_predicted_lot_time = model(
+            loaded_batch["candidate_map_patch_batch"],
+            loaded_batch["normalized_route_batch"],
+            loaded_batch["normalized_task_batch"],
+            loaded_batch["position_encoding_batch"],
+            route_padding_mask = loaded_batch["route_padding_mask"]
+        )
+        
+    print("批次预测的成功分数形状：",batch_success_logits.shape)
+    print("批次预测的对数耗时形状：",batch_predicted_lot_time.shape)
+    
+    # 166 计算这个批次的预测损失
+    """
+    沿用之前的损失设计：
+    - 成功预测：BCEWithLogitsLoss。
+    - 对数耗时预测：MSELoss。
+    - 总损失：成功损失 + 0.1 × 耗时损失。
+    """
+    
+    # 创建两个损失函数
+    success_loss_function  = torch.nn.BCEWithLogitsLoss()
+    time_loss_function = torch.nn.MSELoss()
+    
+    # 设置耗时损失权重
+    time_loss_weight = 0.1
+    
+    # 将成功分数与同一批次的成功标签进行比较
+    batch_success_loss = success_loss_function(
+        batch_success_logits,
+        loaded_batch["success_batch"]
+    )
+    
+    # 将预测的对数耗时与同一批次的对数耗时进行比较
+    batch_time_loss = time_loss_function(
+        batch_predicted_lot_time,
+        loaded_batch["log_time_batch"]
+    )
+
+    # 计算总损失
+    batch_total_loss = batch_success_loss + time_loss_weight * batch_time_loss
+
+    print("批次成功损失：", batch_success_loss.item())
+    print("批次耗时损失：", batch_time_loss.item())
+    print("批次总损失：", batch_total_loss.item())
+    
+    # 167 用这个真实批次完成一次参数更新
+    # 创建优化器
+    optimizer = torch.optim.Adam(
+        model.parameters(),
+        lr=0.001
+    )
+    
+    # 切换到训练模式
+    model.train()
+    
+    # 清空旧梯度
+    optimizer.zero_grad()
+    
+    # 记录更新前的成功预测头偏置
+    bias_before_update = model.success_head.bias.item()
+     # 重新进行前向计算，这次记录梯度
+    batch_success_logits, batch_predicted_log_time = model(
+        loaded_batch["candidate_map_patch_batch"],
+        loaded_batch["normalized_route_batch"],
+        loaded_batch["normalized_task_batch"],
+        loaded_batch["position_encoding_batch"],
+        route_padding_mask=loaded_batch["route_padding_mask"]
+    )
+
+    # 根据本次预测结果计算损失
+    batch_success_loss = success_loss_function(
+        batch_success_logits,
+        loaded_batch["success_batch"]
+    )
+
+    batch_time_loss = time_loss_function(
+        batch_predicted_log_time,
+        loaded_batch["log_time_batch"]
+    )
+
+    batch_total_loss = (
+        batch_success_loss + time_loss_weight * batch_time_loss
+    )
+    
+    # 计算梯度，再根据梯度更新参数
+    batch_total_loss.backward()
+    optimizer.step() # 根据梯度更新参数
+    bias_after_update = model.success_head.bias.item()
+    
+    print("本次用于反向传播的总损失：",batch_total_loss.item())
+    print("更新前的成功预测头偏置：",bias_before_update)
+    print("更新后的成功预测偏置头：",bias_after_update)
