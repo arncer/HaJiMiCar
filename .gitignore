@@ -29,6 +29,9 @@
 *.markdown
 *.txt
 !requirements.txt
+!README.md
+!RESEARCH_IMPLEMENTATION.md
+!RESEARCH_DIRECTIONS.md
 *.csv
 *.tsv
 *.jsonl
@@ -37,3 +40,8 @@
 __pycache__/
 *.py[cod]
 .vscode/
+
+# 训练输出、数据准备缓存和交互规划结果
+/runs/
+/prepared_data/
+/planning_results/

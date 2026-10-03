@@ -15,7 +15,8 @@ class LoaderModel(torch.nn.Module):
         task_encoder,
         fusion_encoder,
         success_head,
-        time_head
+        time_head,
+        trajectory_decoder=None
     ):
         """
         | 模块               | 职责              |
@@ -36,6 +37,7 @@ class LoaderModel(torch.nn.Module):
         self.fusion_encoder = fusion_encoder
         self.success_head = success_head
         self.time_head = time_head
+        self.trajectory_decoder = trajectory_decoder
         
     def forward(
         self,
@@ -65,6 +67,23 @@ class LoaderModel(torch.nn.Module):
             [normalized_route_batch, candidate_map_features_batch],
             dim=2
         )
+
+        # 新流程第4步：安装轨迹解码器后，返回车辆状态路径和方向预测。
+        # 沿用已有CNN、Transformer和任务编码器，原候选评分示例仍可单独运行。
+        if self.trajectory_decoder is not None:
+            if route_padding_mask is None:
+                route_padding_mask = torch.zeros(
+                    batch_size, sequence_length, dtype=torch.bool,
+                    device=normalized_route_batch.device,
+                )
+            route_sequence = self.route_encoder(
+                candidate_features_batch, position_encoding_batch,
+                route_padding_mask=route_padding_mask, return_sequence=True,
+            )
+            task_features = self.task_encoder(normalized_task_batch)
+            return self.trajectory_decoder(
+                route_sequence, task_features, normalized_task_batch, route_padding_mask,
+            )
         
         # 编码整条候选路线，当前输出[1,128]
         route_features = self.route_encoder(
@@ -89,3 +108,28 @@ class LoaderModel(torch.nn.Module):
         # 将两个结果一起返回,调用时两个结果可以依次接收
         return success_logits, predicted_log_time
 
+
+def build_trajectory_model(point_count=64, couple_switch=True, use_sequence_directions=False):
+    # 新流程第5步：复制已有模块结构，创建互不共享参数的新模型。
+    # 成功后调用model会得到 [B,N,5] 状态和 [B,N-1] 方向分数。
+    import copy
+    from map_encoder import map_encoder
+    from task_encoder import task_encoder
+    from route_encoder import RouteEncoder, region_projection, transformer_layer
+    from prediction_head import fusion_encoder, success_head, time_head
+    from trajectory_decoder import TrajectoryDecoder
+    return LoaderModel(
+        copy.deepcopy(map_encoder),
+        RouteEncoder(copy.deepcopy(region_projection), copy.deepcopy(transformer_layer)),
+        copy.deepcopy(task_encoder), copy.deepcopy(fusion_encoder),
+        copy.deepcopy(success_head), copy.deepcopy(time_head),
+        TrajectoryDecoder(point_count, couple_switch, use_sequence_directions),
+    )
+
+
+def predict_batch(model, batch):
+    return model(
+        batch["candidate_map_patch_batch"], batch["normalized_route_batch"],
+        batch["normalized_task_batch"], batch["position_encoding_batch"],
+        route_padding_mask=batch["route_padding_mask"],
+    )

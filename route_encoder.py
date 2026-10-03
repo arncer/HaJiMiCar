@@ -45,7 +45,8 @@ class RouteEncoder(torch.nn.Module): #定义一种名为 RouteEncoder 的网络�
         candidate_region_features_batch,
         position_encoding_batch,
         # 新增 route_padding_mask=None：让路线编码器可以接收掩码。None 表示默认不提供掩码，因此之前只传入两个参数的调用仍然可以运行。
-        route_padding_mask = None #若传或传反，后续本来不能参与注意力的也会参与注意力
+        route_padding_mask = None, #若传或传反，后续本来不能参与注意力的也会参与注意力
+        return_sequence = False
     ):  
         ## 使用编码器中的投影层，让每个区域的66维特征转换成128维度表示
         projected_region_features_batch = self.region_projection(candidate_region_features_batch)
@@ -57,6 +58,10 @@ class RouteEncoder(torch.nn.Module): #定义一种名为 RouteEncoder 的网络�
             ## 传入掩码，让 Transformer 层在计算注意力时忽略被掩码的位置
             src_key_padding_mask=route_padding_mask,
         )
+        # 新流程第3步：轨迹解码器需要查看每个路线位置，因此可以返回整个序列。
+        # 默认仍返回原来的平均特征；return_sequence=True 时应得到 [B,L,128]。
+        if return_sequence:
+            return transformer_output
         ## 沿区域维度求平均，得到整条线路的[1,128]维度特征
         ##注意力掩码不会替我们修改最后的平均计算，例如例如，真实数值是 2、4，后面补了两个零：
         # 对全部位置求平均：(2＋4＋0＋0) ÷ 4 = 1.5
@@ -97,4 +102,3 @@ class RouteEncoder(torch.nn.Module): #定义一种名为 RouteEncoder 的网络�
 if __name__ == "__main__":
     route_encoder = RouteEncoder(region_projection, transformer_layer) # 创建路线编码器对象
     print(route_encoder) # 打印路线编码器的结构
-    

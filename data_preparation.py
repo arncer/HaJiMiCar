@@ -1,7 +1,7 @@
 #139 把训练索引读取成一个列表
 
 import json
-from config import data_dir
+from config import data_dir, articulation_limit
 import numpy as np
 import torch
 from features import normalize_coordinate, encode_heading, normalize_articulation
@@ -93,12 +93,25 @@ def read_map_data(data_dir,record):
     map_path = data_dir/record["map_path"]
     
     with np.load(map_path) as map_file:
+        if "map_id" in record and "map_id" in map_file.files:
+            if str(map_file["map_id"]) != record["map_id"]:
+                raise ValueError("地图文件内的编号与索引不一致")
         map_data = {
-            "map_features":map_file["map_features"],
+            "map_features":map_file["map_features"].astype(np.float32),
             "origin":map_file["origin"],
             "origin_yaw":map_file["origin_yaw"],
             "resolution":map_file["resolution"]
         }
+    # 新流程允许用户加载自己的矩形地图，先检查形状和单位，避免错误延迟到网络内部。
+    map_features = map_data["map_features"]
+    if map_features.ndim != 3 or map_features.shape[0] != 3 or min(map_features.shape[1:]) < 2:
+        raise ValueError("map_features必须为[3,H,W]，且宽高至少为2")
+    if not np.isfinite(map_features).all() or np.any(map_features[1] < 0):
+        raise ValueError("地图特征必须有限，障碍距离通道不能为负")
+    if np.shape(map_data["origin"]) != (2,) or not np.isfinite(map_data["origin"]).all():
+        raise ValueError("地图origin必须为两个有限坐标")
+    if not np.isfinite(float(map_data["origin_yaw"])) or not np.isfinite(float(map_data["resolution"])) or float(map_data["resolution"]) <= 0:
+        raise ValueError("地图方向必须有限，resolution必须为正")
     return map_data
 
 
@@ -198,23 +211,24 @@ def prepare_state_features(state,map_data):
     map_origin = map_data["origin"]
     map_resolution = map_data["resolution"]
     
-    #方向角检查，当前地图方向角为0，可以沿用之前的坐标转换公式。检查这一点，避免把同一公式误用旋转之后的地图
-    if float(map_data["origin_yaw"]) != 0.0:
-        raise ValueError("当前坐标转换要求地图方向角0")
-    
-    # 先减去地图原点，再除以分辨率，把实际的位置转换成以“格”为单位
-    grid_x = (state[0] - map_origin[0]) / map_resolution
-    grid_y = (state[1] - map_origin[1]) / map_resolution
+    # 新流程第2步：先旋转到地图坐标系，再换算为格坐标，支持旋转后的矩形地图。
+    # 成功后，同一任务与地图一起旋转时，得到的归一化输入应保持一致。
+    origin_yaw = float(map_data["origin_yaw"])
+    delta_x = state[0] - map_origin[0]
+    delta_y = state[1] - map_origin[1]
+    grid_x = (math.cos(origin_yaw) * delta_x + math.sin(origin_yaw) * delta_y) / map_resolution
+    grid_y = (-math.sin(origin_yaw) * delta_x + math.cos(origin_yaw) * delta_y) / map_resolution
     
     # 归一化x,y
     normalized_x = normalize_coordinate(grid_x, map_features.shape[2])
     normalized_y = normalize_coordinate(grid_y, map_features.shape[1])
     
     # encode_heading(state[2])把航向角转换成余弦和正弦两个数
-    heading_features = encode_heading(state[2])
+    # 沿用仓库已有顺序：[x, y, sin(航向), cos(航向), 铰接角]。
+    heading_features = encode_heading(state[2] - origin_yaw)
     
     # 把铰链角上限 35° 转换成弧度，再用已有函数归一化 state[3] 中的铰链角
-    articulation_limit_radians = math.radians(35.0)\
+    articulation_limit_radians = articulation_limit
     # 进行铰链角度的归一化，教练角度限制在+-35°之间
     normalized_theta = normalize_articulation(
         state[3],
@@ -338,7 +352,7 @@ repeat(batch_size, 1, 1) 表示第一维复制 batch_size 份，后两维不重�
 """
 后面每个区域中心都需要提取一个 32 × 32 的地图块。
 如果中心靠近地图边缘，直接切片可能得到不足大小的地图块。
-因此，先在地图四周各补 16 格，这一步采用全通道补 0 的边界处理约定。
+因此，先在地图四周各补16格：占用通道补1，距离和骨架通道补0。
 
 """
 def prepare_padded_map(map_data,patch_half_size = 16):
@@ -351,13 +365,14 @@ def prepare_padded_map(map_data,patch_half_size = 16):
     map_height = map_tensor.shape[1]
     map_width = map_tensor.shape[2]
     
-    #创建更大的地图，初始值全部为0
+    # 地图外没有可通行证据：占用通道补1，距离和骨架通道补0。
     padded_map_tensor = torch.zeros(
         channel_count,
         map_height+2 * patch_half_size,
         map_width+2 * patch_half_size,
         dtype = torch.float32
     )
+    padded_map_tensor[0] = 1.0
     
     # 原始地图放在新地图中间
     ## 原来的中心坐标 (x, y) 对应新地图中的 (x + 16, y + 16)，后面裁剪时会用到。
